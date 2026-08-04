@@ -1,0 +1,39 @@
+# Part 1: a single node.
+#
+#   make up-part1     start
+#   make demo-part1   start and walk the assignment's examples
+name: codakv-part1
+
+services:
+  node:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CMD: node
+    ports:
+      # Override with HOST_PORT if 8081 is taken on your machine.
+      - "${HOST_PORT:-8081}:8081"
+    environment:
+      NODE_ID: node-1
+      LISTEN_ADDR: ":8081"
+
+      # One node owns the whole keyspace: NODE_COUNT=1 means RangeFor yields
+      # every partition.
+      NODE_INDEX: "0"
+      NODE_COUNT: "1"
+
+      # Must be a power of two. 1024 keeps placement skew under 5% out to about
+      # a hundred nodes and costs roughly 80 KB in empty partitions.
+      PARTITION_COUNT: "1024"
+
+      MAX_VALUE_BYTES: "1048576" # 1 MiB  — ruling R6, exceeded gives 413
+      MAX_KEY_BYTES: "1024"      # 1 KiB  — ruling R8, exceeded gives 414
+    # Capped so the Part 1 and Part 2 stacks can be compared fairly: each node
+    # gets the same slice of CPU, and adding nodes therefore adds real capacity.
+    cpus: "0.5"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15

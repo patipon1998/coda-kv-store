@@ -1,0 +1,107 @@
+# Part 2: a stateless proxy in front of three nodes.
+#
+#   make up-part2     start
+#   make demo-part2   start and walk routing, listing, node failure, misrouting
+#
+# Only the proxy publishes a port. The nodes are reachable on the internal
+# network, which mirrors how this would actually be deployed and keeps the demo
+# honest about the proxy being the entry point.
+name: codakv-part2
+
+x-node: &node
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    args:
+      CMD: node
+  environment: &node-env
+    LISTEN_ADDR: ":8081"
+    PARTITION_COUNT: "1024"
+    NODE_COUNT: "3"
+    MAX_VALUE_BYTES: "1048576"
+    MAX_KEY_BYTES: "1024"
+  # Same cap as the Part 1 node, so three nodes really do have three times the
+  # CPU. Without this, every "node" would share one machine and throughput could
+  # not scale no matter how many were added.
+  cpus: "0.5"
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+    interval: 2s
+    timeout: 2s
+    retries: 15
+
+services:
+  # Each node derives its own partition range from NODE_INDEX and NODE_COUNT via
+  # routing.RangeFor — the same function the proxy uses to build its table, so
+  # the two cannot drift. A node knows which slot it occupies and nothing about
+  # where its peers are.
+  node-1:
+    <<: *node
+    environment:
+      <<: *node-env
+      NODE_ID: node-1
+      NODE_INDEX: "0"
+
+  node-2:
+    <<: *node
+    environment:
+      <<: *node-env
+      NODE_ID: node-2
+      NODE_INDEX: "1"
+
+  node-3:
+    <<: *node
+    environment:
+      <<: *node-env
+      NODE_ID: node-3
+      NODE_INDEX: "2"
+
+  proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CMD: proxy
+    ports:
+      # Override with HOST_PORT if 8081 is taken on your machine.
+      - "${HOST_PORT:-8081}:8081"
+    environment:
+      LISTEN_ADDR: ":8081"
+
+      # Order matters: a node's position here fixes its partition range, and it
+      # must match that node's NODE_INDEX.
+      NODES: "node-1=http://node-1:8081,node-2=http://node-2:8081,node-3=http://node-3:8081"
+
+      # Must match every node. A mismatch would be silent misrouting rather than
+      # a startup failure, so the proxy sends this as a header on every request
+      # and nodes reject a disagreement with 421.
+      PARTITION_COUNT: "1024"
+
+      REQUEST_TIMEOUT: "5s"
+    # Deliberately generous: the point of the comparison is node throughput, so
+    # the router must not be the limiting factor.
+    cpus: "2.0"
+    depends_on:
+      node-1: {condition: service_healthy}
+      node-2: {condition: service_healthy}
+      node-3: {condition: service_healthy}
+
+  # Same as node-3 but deliberately told it owns node-1's range, to demonstrate
+  # the 421 misdirected-request check.
+  #
+  #   docker compose -f deploy/compose.part2.yml --profile misroute up -d node-bad
+  #
+  # It publishes 8084 so it can be hit directly, bypassing the proxy.
+  #
+  # Without that check a misconfigured proxy would write a key here, return 200,
+  # and every later read would be routed elsewhere and 404 — data lost with no
+  # error anywhere in the system.
+  node-bad:
+    <<: *node
+    profiles: ["misroute"]
+    environment:
+      <<: *node-env
+      NODE_ID: node-bad
+      OWNED_PARTITIONS: "0-341"
+    ports:
+      - "8084:8081"

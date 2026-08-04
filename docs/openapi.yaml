@@ -1,0 +1,606 @@
+openapi: 3.1.0
+
+info:
+  title: codakv
+  version: "1.0.0"
+  summary: A versioned key/value store with optimistic concurrency control.
+  description: |
+    Stores arbitrary JSON by string key, with a **version per key** and
+    compare-and-set writes.
+
+    ## The proxy and a node speak the same API
+
+    Every path below is served by both a store node and the routing proxy, with
+    one exception (`/routing`, which only the proxy has). That is deliberate: it
+    makes the proxy a transparent pass-through, and a single node simply a
+    one-node cluster. A client can be pointed at either and cannot tell the
+    difference — the conformance test suite is run against both and required to
+    produce identical results.
+
+    ## Concurrency
+
+    Each write bumps the key's version. Writes may be guarded:
+
+    - `ifVersion=N` applies the write only if the key is currently at version
+      `N`, and otherwise fails with `409`. **The 409 body carries the key's
+      current version**, so a client can retry without a second round trip to
+      re-read it.
+    - `ifAbsent=true` applies the write only if the key does not yet exist.
+
+    A read-modify-write is therefore a client-side loop: `GET`, compute,
+    `PUT ?ifVersion=<version read>`, and on `409` re-read and try again.
+
+    That loop is not optional. The server applies every individual write
+    atomically, but a `GET` and a `PUT` are separate requests — the server has no
+    way to know two of them were meant to be one operation, and it cannot hold a
+    lock across a client's think time. Without `ifVersion`, three clients each
+    performing 100 increments produce roughly 120, not 300, and **every one of
+    those writes succeeds**: the version still reaches 300 while most of the
+    increments have overwritten one another.
+
+    `ifAbsent` exists because a compare-and-set loop cannot protect its *first*
+    write — with the key absent there is no version to assert, so two clients
+    would both write unconditionally and one increment would be lost. It is the
+    same primitive as DynamoDB's `attribute_not_exists`.
+
+    ## Values
+
+    Values are stored as raw bytes and returned unchanged, so **key order is
+    preserved** — `{"b":1,"a":2}` does not come back as `{"a":2,"b":1}`.
+    Insignificant whitespace is not preserved: it is removed when the value is
+    embedded in the JSON response.
+
+  license:
+    name: Assignment submission — not licensed for redistribution
+
+servers:
+  - url: http://localhost:8081
+    description: |
+      The proxy (Part 2) or a single node (Part 1). Both serve this API; only the
+      proxy serves `/routing`.
+
+tags:
+  - name: kv
+    description: Key/value operations.
+  - name: cluster
+    description: Cluster introspection.
+
+paths:
+  /kv/{key}:
+    parameters:
+      - $ref: "#/components/parameters/Key"
+
+    get:
+      tags: [kv]
+      summary: Read a key
+      operationId: getKey
+      responses:
+        "200":
+          $ref: "#/components/responses/Entry"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "414":
+          $ref: "#/components/responses/KeyTooLong"
+        "421":
+          $ref: "#/components/responses/Misdirected"
+        "503":
+          $ref: "#/components/responses/NodeUnreachable"
+
+    put:
+      tags: [kv]
+      summary: Replace a key's value
+      description: |
+        Replaces the value entirely and bumps the version. Fields present in the
+        old value but absent from the new one are gone.
+
+        Creates the key if it does not exist, at version 1.
+      operationId: putKey
+      parameters:
+        - $ref: "#/components/parameters/IfVersion"
+        - $ref: "#/components/parameters/IfAbsent"
+      requestBody:
+        $ref: "#/components/requestBodies/Value"
+      responses:
+        "200":
+          $ref: "#/components/responses/Entry"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/VersionConflict"
+        "413":
+          $ref: "#/components/responses/ValueTooLarge"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "414":
+          $ref: "#/components/responses/KeyTooLong"
+        "421":
+          $ref: "#/components/responses/Misdirected"
+        "503":
+          $ref: "#/components/responses/NodeUnreachable"
+
+    patch:
+      tags: [kv]
+      summary: Merge a delta into a key's value
+      description: |
+        The body is a delta, applied by three rules in order:
+
+        1. **Key absent** — the delta becomes the value verbatim, at version 1,
+           even if it is not an object.
+        2. **Both the current value and the delta are JSON objects** — top-level
+           fields are **shallow**-merged, with the delta winning on conflict.
+        3. **Otherwise** — the delta replaces the value entirely, exactly as
+           `PUT` would.
+
+        Two consequences of "shallow" that are easy to get wrong:
+
+        - A nested object in the delta **replaces** its counterpart rather than
+          merging into it. Patching `{"a":{"y":2}}` onto `{"a":{"x":1}}` yields
+          `{"a":{"y":2}}` — `a.x` is gone.
+        - A `null` field **sets that field to null**; it does not delete it.
+          This differs from RFC 7386 JSON Merge Patch deliberately: the
+          specification calls for a shallow merge of top-level fields, which is
+          not Merge Patch, and deleting would be inventing semantics.
+
+        An empty delta (`{}`) leaves the value unchanged but **still bumps the
+        version** — the version counts writes, not value changes.
+      operationId: patchKey
+      parameters:
+        - $ref: "#/components/parameters/IfVersion"
+        - $ref: "#/components/parameters/IfAbsent"
+      requestBody:
+        $ref: "#/components/requestBodies/Delta"
+      responses:
+        "200":
+          $ref: "#/components/responses/Entry"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/VersionConflict"
+        "413":
+          $ref: "#/components/responses/ValueTooLarge"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "414":
+          $ref: "#/components/responses/KeyTooLong"
+        "421":
+          $ref: "#/components/responses/Misdirected"
+        "503":
+          $ref: "#/components/responses/NodeUnreachable"
+
+  /kv:
+    get:
+      tags: [kv]
+      summary: List every key
+      description: |
+        Streams one JSON object per line as **NDJSON**
+        (`application/x-ndjson`, chunked). On a node this lists that node's own
+        keys; on the proxy it fans out to every node concurrently and forwards
+        the lines as they arrive.
+
+        NDJSON rather than a JSON array because merging several nodes' streams is
+        then plain concatenation — no parsing, no bracket repair — memory stays
+        constant however large the keyspace is, and a failure can still be
+        signalled mid-stream by emitting one more line.
+
+        ### Partial failure
+
+        If a node becomes unreachable during the fan-out, `200` and some number of
+        lines have already been sent and the status cannot be retracted. The
+        proxy therefore appends an **error line** and the client must check for
+        it:
+
+        ```
+        {"key":"a","node":"node-1"}
+        {"key":"b","node":"node-2"}
+        {"error":"node node-3 unreachable"}
+        ```
+
+        ### Consistency
+
+        The result is not a point-in-time snapshot. Partitions are walked one at a
+        time rather than locked all at once, so a key present for the whole scan
+        is guaranteed to appear, while one created midway may or may not. Keys
+        never move between partitions, so nothing can be seen twice or skipped
+        because of the traversal itself.
+      operationId: listKeys
+      responses:
+        "200":
+          description: A stream of NDJSON lines, one per key.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                description: |
+                  Newline-delimited JSON. Each line is either a
+                  `KeyLine` or, on partial failure, an `ErrorLine`.
+              examples:
+                cluster:
+                  summary: Keys from a three-node cluster
+                  value: |
+                    {"key":"user:42","node":"node-1"}
+                    {"key":"session:7","node":"node-3"}
+                    {"key":"cart:19","node":"node-2"}
+                partialFailure:
+                  summary: One node unreachable mid-stream
+                  value: |
+                    {"key":"user:42","node":"node-1"}
+                    {"key":"cart:19","node":"node-2"}
+                    {"error":"node node-3 unreachable"}
+                empty:
+                  summary: Empty store
+                  value: ""
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /routing:
+    get:
+      tags: [cluster]
+      summary: The live partition-to-node table (proxy only)
+      description: |
+        Shows how the keyspace is divided. A key is routed by
+        `FNV-1a(key) mod partitionCount`, and the resulting partition belongs to
+        exactly one node.
+
+        Partition count is fixed for the cluster's life and independent of node
+        count. That indirection is the point: hashing straight to a node
+        (`hash mod nodeCount`) would move roughly 75% of all keys when growing
+        from three nodes to four, whereas moving whole partitions moves exactly
+        25% — the theoretical minimum — and no key is ever rehashed.
+      operationId: getRouting
+      responses:
+        "200":
+          description: The current routing table.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [partitionCount, nodes]
+                properties:
+                  partitionCount:
+                    type: integer
+                    examples: [1024]
+                  nodes:
+                    type: array
+                    items:
+                      type: object
+                      required: [node, address, partitions, count]
+                      properties:
+                        node:
+                          type: string
+                          examples: ["node-1"]
+                        address:
+                          type: string
+                          examples: ["http://node-1:8081"]
+                        partitions:
+                          type: string
+                          description: Inclusive partition range.
+                          examples: ["0-341"]
+                        count:
+                          type: integer
+                          examples: [342]
+              example:
+                partitionCount: 1024
+                nodes:
+                  - {node: node-1, address: "http://node-1:8081", partitions: "0-341", count: 342}
+                  - {node: node-2, address: "http://node-2:8081", partitions: "342-682", count: 341}
+                  - {node: node-3, address: "http://node-3:8081", partitions: "683-1023", count: 341}
+
+  /health:
+    get:
+      tags: [cluster]
+      summary: Liveness and configuration
+      operationId: getHealth
+      responses:
+        "200":
+          description: The process is serving, and reports how it is configured.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    title: Node
+                    required: [node, partitions, ownedPartitions]
+                    properties:
+                      node: {type: string}
+                      partitions: {type: integer}
+                      ownedPartitions:
+                        type: string
+                        description: The partition range this node accepts.
+                  - type: object
+                    title: Proxy
+                    required: [role, partitionCount, nodes]
+                    properties:
+                      role: {type: string, const: proxy}
+                      partitionCount: {type: integer}
+                      nodes:
+                        type: array
+                        items: {type: string}
+              examples:
+                node:
+                  value: {node: "node-1", partitions: 1024, ownedPartitions: "0-341"}
+                proxy:
+                  value: {role: proxy, partitionCount: 1024, nodes: [node-1, node-2, node-3]}
+
+components:
+  parameters:
+    Key:
+      name: key
+      in: path
+      required: true
+      description: |
+        The key, **percent-encoded**. Characters that would otherwise be read as
+        path or query syntax must be escaped, and are then part of the key:
+
+        | Key | Request path |
+        |---|---|
+        | `user:42` | `/kv/user:42` |
+        | `a/b` | `/kv/a%2Fb` |
+        | `k?x=1` | `/kv/k%3Fx%3D1` |
+        | `key with space` | `/kv/key%20with%20space` |
+
+        An unencoded `/kv/a/b` is two path segments, matches no route, and
+        returns `404`. So does an empty key (`/kv/`).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 1024
+      examples:
+        simple: {value: "user:42"}
+        encodedSlash: {summary: "The key a/b", value: "a%2Fb"}
+
+    IfVersion:
+      name: ifVersion
+      in: query
+      required: false
+      description: |
+        Apply the write only if the key is currently at this version; otherwise
+        fail with `409`.
+
+        Versions start at **1** and increase by one per successful write, so `0`
+        never matches anything. Asserting a version against a key that does not
+        exist also fails with `409` — use `ifAbsent` to require absence.
+
+        Supplying the parameter more than once is rejected with `400`: the intent
+        is ambiguous, and silently taking the first value is how bugs hide.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 7
+
+    IfAbsent:
+      name: ifAbsent
+      in: query
+      required: false
+      description: |
+        Apply the write only if the key does not yet exist; otherwise fail with
+        `409`.
+
+        Cannot be combined with `ifVersion` — the two assertions contradict each
+        other, and doing so is rejected with `400`.
+      schema:
+        type: string
+        enum: ["true", "false", "1", "0"]
+      example: "true"
+
+  requestBodies:
+    Value:
+      required: true
+      description: Any JSON value — object, array, string, number, boolean or null.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnyJSON"
+          examples:
+            object: {value: {name: "Ari", points: 10}}
+            array: {value: [1, 2, 3]}
+            scalar: {value: 42}
+            null_:
+              summary: Storing null — distinct from the key being absent
+              value: null
+
+    Delta:
+      required: true
+      description: |
+        Any JSON value. Merged into the existing value when both are objects,
+        and otherwise used as a replacement.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnyJSON"
+          examples:
+            merge:
+              summary: Adds or overwrites top-level fields
+              value: {rank: "gold"}
+            emptyDelta:
+              summary: Changes nothing, but still bumps the version
+              value: {}
+            nullField:
+              summary: Sets the field to null — does not delete it
+              value: {points: null}
+
+  responses:
+    Entry:
+      description: The key's value and the version that produced it.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Entry"
+          examples:
+            created:
+              summary: First write
+              value: {key: "user:42", value: {name: "Ari", points: 10}, version: 1}
+            merged:
+              summary: After PATCH {"rank":"gold"}
+              value: {key: "user:42", value: {name: "Ari", points: 20, rank: "gold"}, version: 3}
+
+    NotFound:
+      description: No such key.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: "key not found", key: "user:42"}
+
+    BadRequest:
+      description: |
+        The body is not valid JSON, or a query parameter is malformed —
+        a non-numeric or negative `ifVersion`, one that overflows `uint64`, a
+        repeated parameter, or `ifVersion` and `ifAbsent` together.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          examples:
+            badJSON: {value: {error: "body is not valid JSON", key: "user:42"}}
+            badGuard: {value: {error: "ifVersion must be a non-negative integer", key: "user:42"}}
+            conflictingGuards: {value: {error: "ifAbsent and ifVersion cannot both be set", key: "user:42"}}
+
+    VersionConflict:
+      description: |
+        The guard failed: `ifVersion` did not match, or `ifAbsent` was requested
+        for a key that already exists.
+
+        **The body carries the key's current version**, so a client's retry loop
+        does not need a second round trip to re-read it. The field is omitted
+        when the key does not exist, which is unambiguous because no stored key
+        ever has version 0.
+
+        A rejected write does not bump the version and does not alter the value.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          examples:
+            staleVersion:
+              summary: Asked for version 1, the key is at 3
+              value: {error: "version mismatch", key: "user:42", version: 3}
+            absentKey:
+              summary: Asserted a version against a key that does not exist
+              value: {error: "version mismatch", key: "user:99"}
+
+    ValueTooLarge:
+      description: The body exceeds the configured maximum (1 MiB by default).
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: "value too large", key: "user:42"}
+
+    KeyTooLong:
+      description: The key exceeds the configured maximum (1 KiB by default).
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: "key too long"}
+
+    Misdirected:
+      description: |
+        The request reached a node that does not own this key's partition, or the
+        caller declared a different partition count via `X-Partition-Count`.
+
+        This check turns a routing misconfiguration into a loud failure. Without
+        it the write would return `200`, and every subsequent read — routed
+        correctly — would return `404`: data lost, with no error raised anywhere.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          examples:
+            wrongNode:
+              value:
+                error: 'node node-3 owns partitions 683-1023, but key "user:42" is in partition 137'
+                key: "user:42"
+            partitionCountMismatch:
+              value: {error: "node node-1 is configured for 1024 partitions, caller assumed 256"}
+
+    MethodNotAllowed:
+      description: |
+        The path exists but does not support this method. The response carries an
+        `Allow` header, and — like every other failure — a JSON body rather than
+        the plain text a bare router would emit.
+      headers:
+        Allow:
+          description: Methods this path does support.
+          schema:
+            type: string
+            examples: ["GET, PUT, PATCH"]
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: "DELETE is not supported on this resource", key: "user:42"}
+
+    NodeUnreachable:
+      description: |
+        Returned by the proxy when the node owning this key cannot be reached.
+
+        Note the proxy does **not** retry the request. A timeout is ambiguous —
+        the write may have been applied with only the response lost — and
+        retrying a read-modify-write that already succeeded would apply it twice.
+        Retrying is the client's decision, and only ever on a definitively
+        received `409`.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: "node node-2 unreachable", key: "user:42"}
+
+  schemas:
+    AnyJSON:
+      description: |
+        Any JSON value. An empty schema in OpenAPI 3.1 accepts every type,
+        including `null` — which is a stored value distinct from the key being
+        absent.
+
+    Entry:
+      type: object
+      required: [key, value, version]
+      properties:
+        key:
+          type: string
+          description: The key, decoded.
+          examples: ["user:42"]
+        value:
+          $ref: "#/components/schemas/AnyJSON"
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Increases by one per successful write. Starts at 1; version 0 never
+            exists, which is what lets its absence signal "no such key".
+          examples: [3]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: A human-readable explanation. Not a stable machine identifier — use the status code.
+        key:
+          type: string
+          description: The key the request concerned, when one applies.
+        version:
+          type: integer
+          format: int64
+          description: |
+            Present on `409` when the key exists: its current version, so a retry
+            needs no extra read.
+
+    KeyLine:
+      type: object
+      description: One line of a `GET /kv` stream.
+      required: [key, node]
+      properties:
+        key: {type: string, examples: ["user:42"]}
+        node:
+          type: string
+          description: The node holding this key.
+          examples: ["node-1"]
+
+    ErrorLine:
+      type: object
+      description: |
+        A failure reported mid-stream by `GET /kv`. The `200` status was
+        committed with the first line and cannot be retracted, so this is the
+        only way to report a node that dropped out during the fan-out.
+      required: [error]
+      properties:
+        error: {type: string, examples: ["node node-3 unreachable"]}
